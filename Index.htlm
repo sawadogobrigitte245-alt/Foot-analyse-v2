@@ -1,0 +1,387 @@
+
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+load_dotenv()
+
+API_URL = os.getenv(
+    "REEVOLUTION_API_URL",
+    "https://reevolution.vip/api/opportunities/?flux=prematch"
+).strip()
+
+TOKEN = os.getenv("REEVOLUTION_TOKEN", "").strip()
+POLL_SECONDS = max(60, int(os.getenv("POLL_SECONDS", "300")))
+TIMEOUT = 20.0
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+DATA_FILE = DATA_DIR / "opportunities.json"
+ANALYSIS_FILE = DATA_DIR / "analysis.json"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("reevolution")
+
+state = {
+    "status": "Démarrage",
+    "last_update": None,
+    "last_error": None,
+    "record_count": 0,
+}
+
+
+# =========================================================
+# API : RÉCUPÉRATION DES DONNÉES
+# =========================================================
+
+async def fetch_data():
+    if not TOKEN:
+        raise RuntimeError(
+            "Configure REEVOLUTION_TOKEN dans les variables "
+            "d'environnement."
+        )
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzkzMDQwODczLCJpYXQiOjE3OTMwMzk5NzMsImp0aSI6IjI4MjExYWY4OTgwMTRlZTg4YjRhOGJmY2I3MzY2MjI3IiwidXNlcl9pZCI6IjQ4In0.r7h015x2J4IgI1hwmVfMGcYtDlNmn-wuU-cO4fBHDXM",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT,
+        follow_redirects=False,
+    ) as client:
+        response = await client.get(API_URL, headers=headers)
+
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            f"Accès API refusé : HTTP {response.status_code}. "
+            "Vérifie les droits du jeton."
+        )
+
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "")
+    if "json" not in content_type.lower():
+        raise ValueError(
+            f"La réponse n'est pas du JSON : {content_type}"
+        )
+
+    return response.json()
+
+
+# =========================================================
+# ANALYSE DES DONNÉES REÇUES
+# =========================================================
+
+LIST_KEYS = (
+    "data",
+    "opportunities",
+    "results",
+    "items",
+    "matches",
+    "events",
+)
+
+
+def find_records(payload):
+    """Recherche les listes d'objets dans les structures JSON."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    for key in LIST_KEYS:
+        value = payload.get(key)
+
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+
+        if isinstance(value, dict):
+            found = find_records(value)
+            if found:
+                return found
+
+    return []
+
+
+def summarize_record(record):
+    """Extrait les champs courants sans supposer qu'ils existent."""
+    return {
+        "id": record.get("id", record.get("gameId")),
+        "home": (
+            record.get("home")
+            or record.get("homeTeam")
+            or record.get("opponent1")
+        ),
+        "away": (
+            record.get("away")
+            or record.get("awayTeam")
+            or record.get("opponent2")
+        ),
+        "competition": (
+            record.get("competition")
+            or record.get("league")
+            or record.get("liga")
+        ),
+        "status": record.get("status"),
+        "available_fields": sorted(str(k) for k in record.keys()),
+    }
+
+
+def analyze_data(payload):
+    records = find_records(payload)
+
+    summaries = [
+        summarize_record(record)
+        for record in records[:500]
+    ]
+
+    all_fields = sorted({
+        str(key)
+        for record in records
+        for key in record.keys()
+    })
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "record_count": len(records),
+        "top_level_type": type(payload).__name__,
+        "top_level_keys": (
+            sorted(payload.keys())
+            if isinstance(payload, dict)
+            else []
+        ),
+        "observed_fields": all_fields,
+        "records": summaries,
+        "note": (
+            "Analyse descriptive des champs détectés. "
+            "Les résultats sportifs ne peuvent pas être prédits "
+            "fiablement sans historique et modèle validé."
+        ),
+    }
+
+
+# =========================================================
+# ENREGISTREMENT JSON
+# =========================================================
+
+def write_json(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_json(path):
+    if not path.exists():
+        return None
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# =========================================================
+# COLLECTE AUTOMATIQUE
+# =========================================================
+
+async def update_once():
+    payload = await fetch_data()
+    report = analyze_data(payload)
+
+    write_json(DATA_FILE, {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    })
+    write_json(ANALYSIS_FILE, report)
+
+    state["status"] = "Actif"
+    state["last_update"] = datetime.now(timezone.utc).isoformat()
+    state["last_error"] = None
+    state["record_count"] = report["record_count"]
+
+    logger.info(
+        "Collecte réussie : %s élément(s)",
+        report["record_count"],
+    )
+
+
+async def collector_loop():
+    while True:
+        try:
+            await update_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # N'affiche ni jeton ni en-têtes d'authentification.
+            state["status"] = "Erreur"
+            state["last_error"] = type(exc).__name__
+            logger.warning(
+                "Collecte échouée : %s",
+                type(exc).__name__,
+            )
+
+        await asyncio.sleep(POLL_SECONDS)
+
+
+# =========================================================
+# INTERFACE WEB
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(collector_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(
+    title="Reevolution Prematch Analyzer",
+    lifespan=lifespan,
+)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse("""
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analyse prématch</title>
+<style>
+body{font-family:Arial,sans-serif;background:#101827;color:#eef4ff;
+margin:0;padding:22px}
+main{max-width:900px;margin:auto}
+section{background:#1a2638;border:1px solid #34445c;border-radius:12px;
+padding:16px;margin:14px 0;overflow-wrap:anywhere}
+button{padding:10px 15px;border:0;border-radius:8px;cursor:pointer}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:450px;overflow:auto}
+a{color:#7ce0b1}
+</style>
+</head>
+<body><main>
+<h1>Analyse des données prématch</h1>
+<p>Tableau de bord de collecte et d'inspection des données.</p>
+<section>
+<h2>État du service</h2>
+<pre id="status">Chargement...</pre>
+<button onclick="refreshData()">Actualiser</button>
+</section>
+<section>
+<h2>Analyse</h2>
+<pre id="analysis">Chargement...</pre>
+</section>
+<p>
+<a href="/api/status">État JSON</a> ·
+<a href="/api/analysis">Analyse JSON</a> ·
+<a href="/api/data">Données brutes</a>
+</p>
+<script>
+async function refreshData(){
+  try{
+    const s = await fetch('/api/status');
+    document.getElementById('status').textContent =
+      JSON.stringify(await s.json(), null, 2);
+    const a = await fetch('/api/analysis');
+    document.getElementById('analysis').textContent =
+      JSON.stringify(await a.json(), null, 2);
+  }catch(e){
+    document.getElementById('status').textContent =
+      'Impossible de charger les données.';
+  }
+}
+refreshData();
+setInterval(refreshData, 15000);
+</script>
+</main></body></html>
+""")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/status")
+async def api_status():
+    return {
+        **state,
+        "poll_seconds": POLL_SECONDS,
+    }
+
+
+@app.get("/api/analysis")
+async def api_analysis():
+    data = read_json(ANALYSIS_FILE)
+    if data is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Aucune analyse disponible pour le moment.",
+        )
+    return data
+
+
+@app.get("/api/data")
+async def api_data():
+    data = read_json(DATA_FILE)
+    if data is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Aucune donnée disponible pour le moment.",
+        )
+    return data
+
+
+@app.post("/api/refresh")
+async def manual_refresh():
+    try:
+        await update_once()
+    except Exception as exc:
+        logger.warning("Actualisation manuelle échouée : %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Échec de la collecte. Vérifie la configuration et les journaux."
+        )
+    return {"status": "ok", "record_count": state["record_count"]}
+
+
+# =========================================================
+# LANCEMENT LOCAL
+# =========================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
